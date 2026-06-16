@@ -2,6 +2,7 @@ name: Reusable Release Workflow
 
 # Triggered after production deployment. Automatically:
 #   - Resolves the next semantic version from the latest release tag
+#   - Supports manual bump type: patch (default) | minor | major
 #   - Collects commits since the last release
 #   - Generates grouped release notes (features, fixes, improvements, breaking changes)
 #   - Creates a Git tag and GitHub Release
@@ -14,8 +15,14 @@ name: Reusable Release Workflow
 #       with:
 #         app_name: time-guard
 #         target_repo: your-org/time-guard
+#         version_bump: minor        # optional — patch | minor | major (default: patch)
 #       secrets:
 #         GH_TOKEN: ${{ secrets.GH_PAT }}
+#
+# Version bump behaviour:
+#   patch  →  v1.0.3 → v1.0.4   (default, bug fixes / small changes)
+#   minor  →  v1.0.3 → v1.1.0   (new features, resets patch to 0)
+#   major  →  v1.0.3 → v2.0.0   (breaking changes, resets minor + patch to 0)
 #
 # PAT required scopes:
 #   repo (full) — push tags, create releases, comment on PRs
@@ -37,6 +44,11 @@ on:
         required: false
         type: string
         default: 'production'
+      version_bump:
+        description: 'Which part of the version to increment — patch | minor | major (default: patch)'
+        required: false
+        type: string
+        default: 'patch'
       runs_on:
         description: 'GitHub Actions runner label'
         required: false
@@ -67,30 +79,50 @@ jobs:
       - name: Resolve next version
         id: version
         run: |
+          BUMP="${{ inputs.version_bump }}"
+
+          # Validate bump type
+          if [[ "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
+            echo "❌ Invalid version_bump value: '$BUMP'. Must be patch | minor | major"
+            exit 1
+          fi
+
+          # Get the latest tag sorted by semver
           LAST_TAG=$(git tag --sort=-version:refname | grep "^v" | head -n 1 || echo "")
 
           if [ -z "$LAST_TAG" ]; then
+            # No tags at all — start from v1.0.0 regardless of bump type
             NEW_VERSION="v1.0.0"
             LAST_TAG="none"
             echo "ℹ️  No previous tags found. Starting at $NEW_VERSION"
           else
-            echo "ℹ️  Last release tag: $LAST_TAG"
+            echo "ℹ️  Last release tag : $LAST_TAG"
+            echo "ℹ️  Bump type        : $BUMP"
+
             MAJOR=$(echo "$LAST_TAG" | cut -d. -f1 | tr -d 'v')
             MINOR=$(echo "$LAST_TAG" | cut -d. -f2)
             PATCH=$(echo "$LAST_TAG" | cut -d. -f3)
-            NEW_VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+
+            if [ "$BUMP" = "major" ]; then
+              NEW_VERSION="v$((MAJOR + 1)).0.0"
+            elif [ "$BUMP" = "minor" ]; then
+              NEW_VERSION="v${MAJOR}.$((MINOR + 1)).0"
+            else
+              # patch (default)
+              NEW_VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            fi
           fi
 
-          # Safety: if tag already exists keep incrementing
+          # Safety: if this tag already exists keep incrementing patch
           while git tag | grep -q "^${NEW_VERSION}$"; do
-            echo "⚠️  Tag $NEW_VERSION already exists, incrementing..."
+            echo "⚠️  Tag $NEW_VERSION already exists, incrementing patch..."
             MAJOR=$(echo "$NEW_VERSION" | cut -d. -f1 | tr -d 'v')
             MINOR=$(echo "$NEW_VERSION" | cut -d. -f2)
             PATCH=$(echo "$NEW_VERSION" | cut -d. -f3)
             NEW_VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
           done
 
-          echo "✅ Next version: $NEW_VERSION"
+          echo "✅ Next version : $NEW_VERSION"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "last_tag=$LAST_TAG"   >> "$GITHUB_OUTPUT"
 
@@ -120,6 +152,7 @@ jobs:
           VERSION:   ${{ needs.resolve-version.outputs.version }}
           APP_NAME:  ${{ inputs.app_name }}
           REPO:      ${{ inputs.target_repo }}
+          BUMP:      ${{ inputs.version_bump }}
         run: |
           if [ "$LAST_TAG" = "none" ]; then
             MERGE_COMMITS=$(git log origin/${{ inputs.base_branch }} --oneline --merges 2>/dev/null || echo "")
@@ -158,9 +191,16 @@ jobs:
             fi
           done
 
+          # Bump label for release notes header
+          case "$BUMP" in
+            major) BUMP_LABEL="💥 Major Release" ;;
+            minor) BUMP_LABEL="✳️ Minor Release"  ;;
+            *)     BUMP_LABEL="🔩 Patch Release"  ;;
+          esac
+
           {
             echo "release_notes<<RELEASE_EOF"
-            echo "## ${APP_NAME:+$APP_NAME }Release ${VERSION}"
+            echo "## ${APP_NAME:+$APP_NAME }${VERSION} — ${BUMP_LABEL}"
             echo ""
             echo "> 🚀 Deployed to production on $(date +'%Y-%m-%d %H:%M UTC')"
             echo ""
@@ -177,9 +217,10 @@ jobs:
 
           {
             echo "pr_comment<<PR_EOF"
-            echo "## 🚀 Released in ${VERSION}"
+            echo "## 🚀 Released in ${VERSION} (${BUMP_LABEL})"
             echo ""
             echo "**App:** \`${APP_NAME:-this repo}\`"
+            echo "**Version bump:** \`${BUMP}\`"
             echo "**Deployed:** $(date +'%Y-%m-%d %H:%M UTC')"
             echo "**Branch:** \`${{ inputs.base_branch }}\`"
             echo ""
@@ -219,7 +260,6 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Explicitly set remote URL with PAT so push is authenticated
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ inputs.target_repo }}"
 
           git tag -a "$VERSION" -m "Release $VERSION"
