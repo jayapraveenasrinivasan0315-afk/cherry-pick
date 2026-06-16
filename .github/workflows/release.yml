@@ -24,9 +24,10 @@ on:
         required: true
 
 jobs:
+
   # ── 1. RESOLVE VERSION ───────────────────────────────────────────────────
   resolve-version:
-    name: "🔢 Resolve Next Version"
+    name: "Resolve Next Version"
     runs-on: ${{ inputs.runs_on }}
     outputs:
       version:   ${{ steps.version.outputs.version }}
@@ -52,7 +53,6 @@ jobs:
         run: |
           export GH_REPO="$REPO"
 
-          # Get latest merged PR sorted by mergedAt descending
           LATEST_PR=$(gh pr list \
             --state merged \
             --base "$BASE" \
@@ -64,11 +64,8 @@ jobs:
           PR_TITLE=$(echo "$LATEST_PR"  | jq -r '.title  // empty')
           PR_BODY=$(echo "$LATEST_PR"   | jq -r '.body   // empty')
 
-          echo "📄 Latest merged PR: #${PR_NUMBER} — ${PR_TITLE}"
-          echo "📝 PR Body:"
-          echo "$PR_BODY"
+          echo "Latest merged PR: #${PR_NUMBER} - ${PR_TITLE}"
 
-          # ── Detect version bump flags (case-insensitive) ──
           IS_MAJOR=false
           IS_MINOR=false
           IS_PATCH=false
@@ -81,14 +78,13 @@ jobs:
             IS_PATCH=true
           fi
 
-          echo "🔍 Detected — major=$IS_MAJOR minor=$IS_MINOR patch=$IS_PATCH"
+          echo "Detected: major=$IS_MAJOR minor=$IS_MINOR patch=$IS_PATCH"
           echo "is_major=$IS_MAJOR"   >> "$GITHUB_OUTPUT"
           echo "is_minor=$IS_MINOR"   >> "$GITHUB_OUTPUT"
           echo "is_patch=$IS_PATCH"   >> "$GITHUB_OUTPUT"
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "pr_title=$PR_TITLE"   >> "$GITHUB_OUTPUT"
 
-          # Pass full PR body as multiline output
           {
             echo "pr_body<<PR_BODY_EOF"
             echo "$PR_BODY"
@@ -136,12 +132,12 @@ jobs:
             NEW_VERSION="v${MAJOR}.${MINOR_V}.${PATCH_V}"
 
             while git tag | grep -q "^${NEW_VERSION}$"; do
-              echo "⚠️  Tag $NEW_VERSION already exists, incrementing patch..."
+              echo "Tag $NEW_VERSION already exists, incrementing patch..."
               PATCH_V=$((PATCH_V + 1))
               NEW_VERSION="v${MAJOR}.${MINOR_V}.${PATCH_V}"
             done
 
-            echo "✅ Semver mode ($MODE): $NEW_VERSION"
+            echo "Semver mode ($MODE): $NEW_VERSION"
 
           else
             MODE="date"
@@ -173,7 +169,7 @@ jobs:
               NEW_VERSION="${TODAY}.${NEXT_COUNTER}"
             done
 
-            echo "✅ Date-based mode: $NEW_VERSION"
+            echo "Date-based mode: $NEW_VERSION"
           fi
 
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
@@ -182,13 +178,12 @@ jobs:
 
   # ── 2. CREATE TAG & GITHUB RELEASE ──────────────────────────────────────
   release:
-    name: "🏷️ Create Tag & GitHub Release"
+    name: "Create Tag and GitHub Release"
     runs-on: ${{ inputs.runs_on }}
     needs: resolve-version
     outputs:
       release_url: ${{ steps.create.outputs.release_url }}
       compare_url: ${{ steps.create.outputs.compare_url }}
-      # pr_numbers now always includes at least the trigger PR so pr-comment never skips
       pr_numbers:  ${{ steps.create.outputs.pr_numbers }}
     steps:
       - name: Checkout ${{ inputs.base_branch }}
@@ -201,16 +196,16 @@ jobs:
       - name: Create tag, release, and build notes
         id: create
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          VERSION:           ${{ needs.resolve-version.outputs.version }}
-          LAST_TAG:          ${{ needs.resolve-version.outputs.last_tag }}
-          MODE:              ${{ needs.resolve-version.outputs.mode }}
-          LATEST_PR_NUMBER:  ${{ needs.resolve-version.outputs.pr_number }}
-          LATEST_PR_TITLE:   ${{ needs.resolve-version.outputs.pr_title }}
-          LATEST_PR_BODY:    ${{ needs.resolve-version.outputs.pr_body }}
-          APP_NAME:          ${{ inputs.app_name }}
-          BASE:              ${{ inputs.base_branch }}
-          REPO:              ${{ github.repository }}
+          GH_TOKEN:         ${{ secrets.GH_TOKEN }}
+          VERSION:          ${{ needs.resolve-version.outputs.version }}
+          LAST_TAG:         ${{ needs.resolve-version.outputs.last_tag }}
+          MODE:             ${{ needs.resolve-version.outputs.mode }}
+          LATEST_PR_NUMBER: ${{ needs.resolve-version.outputs.pr_number }}
+          LATEST_PR_TITLE:  ${{ needs.resolve-version.outputs.pr_title }}
+          LATEST_PR_BODY:   ${{ needs.resolve-version.outputs.pr_body }}
+          APP_NAME:         ${{ inputs.app_name }}
+          BASE:             ${{ inputs.base_branch }}
+          REPO:             ${{ github.repository }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -218,9 +213,8 @@ jobs:
 
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
-          echo "🏷️ Tag pushed: $VERSION"
+          echo "Tag pushed: $VERSION"
 
-          # ── Build release title ──
           if [ "$MODE" = "major" ]; then
             TITLE="${APP_NAME} Release - ${VERSION} (Major)"
           elif [ "$MODE" = "minor" ]; then
@@ -233,96 +227,74 @@ jobs:
             TITLE="${APP_NAME} Release - ${DATE_PART}.v${COUNTER_PART}"
           fi
 
-          # ── Commit range since last tag ──
           if [ "$LAST_TAG" = "none" ]; then
             RANGE="origin/$BASE"
           else
             RANGE="$LAST_TAG..origin/$BASE"
           fi
 
-          # ── Collect PR numbers from git log commit messages ──
           GIT_PR_NUMBERS=$(git log "$RANGE" --pretty=format:'%s' 2>/dev/null \
             | grep -oE '#[0-9]+' | tr -d '#' | sort -un | tr '\n' ' ' || echo "")
 
-          echo "🔍 PRs found in git log: '${GIT_PR_NUMBERS}'"
+          echo "PRs found in git log: ${GIT_PR_NUMBERS}"
 
-          # ── CRITICAL FIX: always include the trigger PR ──
-          # Even when squash/rebase merges omit #number from commit messages,
-          # the trigger PR from resolve-version is always available.
+          # Always include the trigger PR even if git log missed it (squash/rebase merges)
           COMBINED_PR_NUMBERS="$GIT_PR_NUMBERS"
           if [ -n "$LATEST_PR_NUMBER" ]; then
-            # Add trigger PR only if not already present
             if ! echo " $COMBINED_PR_NUMBERS " | grep -q " ${LATEST_PR_NUMBER} "; then
               COMBINED_PR_NUMBERS="${LATEST_PR_NUMBER} ${COMBINED_PR_NUMBERS}"
-              echo "➕ Trigger PR #${LATEST_PR_NUMBER} added (was missing from git log)"
+              echo "Trigger PR #${LATEST_PR_NUMBER} injected (missing from git log)"
             fi
           fi
-
-          # Trim trailing spaces
           COMBINED_PR_NUMBERS=$(echo "$COMBINED_PR_NUMBERS" | xargs)
-          echo "✅ Final PR list: '${COMBINED_PR_NUMBERS}'"
+          echo "Final PR list: ${COMBINED_PR_NUMBERS}"
 
-          # ── 1. Trigger PR description block (drove this release) ──
-          TRIGGER_PR_SECTION=""
+          # Build release notes into a temp file to avoid YAML multiline issues
+          NOTES_FILE=$(mktemp)
+
+          # Section 1: Trigger PR description
           if [ -n "$LATEST_PR_NUMBER" ] && [ -n "$LATEST_PR_BODY" ]; then
-            TRIGGER_PR_SECTION="## 🎯 Trigger PR — #${LATEST_PR_NUMBER}: ${LATEST_PR_TITLE}
-
-${LATEST_PR_BODY}
-
----
-"
+            printf "## Trigger PR - #%s: %s\n\n%s\n\n---\n\n" \
+              "$LATEST_PR_NUMBER" "$LATEST_PR_TITLE" "$LATEST_PR_BODY" >> "$NOTES_FILE"
           fi
 
-          # ── 2. Other PR descriptions in this release range ──
-          OTHER_PR_DESCRIPTIONS=""
+          # Section 2: Other PRs in this release
+          HAS_OTHER=false
+          OTHER_FILE=$(mktemp)
           for PR in $COMBINED_PR_NUMBERS; do
-            # Skip the trigger PR — already shown above
             if [ "$PR" = "$LATEST_PR_NUMBER" ]; then
               continue
             fi
             DESC=$(gh pr view "$PR" --json body  --jq '.body'  2>/dev/null || echo "")
             if [ -n "$DESC" ] && [ "$DESC" != "null" ]; then
               PR_T=$(gh pr view "$PR" --json title --jq '.title' 2>/dev/null || echo "PR #$PR")
-              OTHER_PR_DESCRIPTIONS="${OTHER_PR_DESCRIPTIONS}
-### PR #${PR} — ${PR_T}
-${DESC}
-
----
-"
+              printf "### PR #%s - %s\n%s\n\n---\n\n" "$PR" "$PR_T" "$DESC" >> "$OTHER_FILE"
+              HAS_OTHER=true
             fi
           done
 
-          # ── 3. Create GitHub release (auto-generates What's Changed) ──
+          if [ "$HAS_OTHER" = "true" ]; then
+            printf "## Other PR Descriptions\n\n" >> "$NOTES_FILE"
+            cat "$OTHER_FILE" >> "$NOTES_FILE"
+          fi
+          rm -f "$OTHER_FILE"
+
+          # Section 3: Create the GitHub release (auto What's Changed)
           gh release create "$VERSION" \
             --title "$TITLE" \
             --generate-notes \
             --target "$BASE"
 
-          echo "✅ GitHub Release created: $VERSION"
+          echo "GitHub Release created: $VERSION"
 
           AUTO_NOTES=$(gh release view "$VERSION" --json body --jq '.body')
           URL=$(gh release view "$VERSION" --json url  --jq '.url')
 
-          # ── 4. Assemble final notes ──
-          # Order: 🎯 Trigger PR → 📋 Other PRs → 🔀 What's Changed
-          FINAL_NOTES=""
+          printf "## What Changed\n\n%s\n" "$AUTO_NOTES" >> "$NOTES_FILE"
 
-          if [ -n "$TRIGGER_PR_SECTION" ]; then
-            FINAL_NOTES="${TRIGGER_PR_SECTION}"
-          fi
-
-          if [ -n "$OTHER_PR_DESCRIPTIONS" ]; then
-            FINAL_NOTES="${FINAL_NOTES}
-## 📋 Other PR Descriptions
-${OTHER_PR_DESCRIPTIONS}"
-          fi
-
-          FINAL_NOTES="${FINAL_NOTES}
-## 🔀 What's Changed
-${AUTO_NOTES}"
-
-          gh release edit "$VERSION" --notes "$FINAL_NOTES"
-          echo "📝 Release notes updated."
+          gh release edit "$VERSION" --notes-file "$NOTES_FILE"
+          rm -f "$NOTES_FILE"
+          echo "Release notes updated."
 
           if [ "$LAST_TAG" = "none" ]; then
             COMPARE_URL=""
@@ -330,34 +302,32 @@ ${AUTO_NOTES}"
             COMPARE_URL="https://github.com/${REPO}/compare/${LAST_TAG}...${VERSION}"
           fi
 
-          echo "release_url=$URL"                      >> "$GITHUB_OUTPUT"
-          echo "compare_url=$COMPARE_URL"              >> "$GITHUB_OUTPUT"
-          echo "pr_numbers=${COMBINED_PR_NUMBERS}"     >> "$GITHUB_OUTPUT"
+          echo "release_url=$URL"                >> "$GITHUB_OUTPUT"
+          echo "compare_url=$COMPARE_URL"        >> "$GITHUB_OUTPUT"
+          echo "pr_numbers=$COMBINED_PR_NUMBERS" >> "$GITHUB_OUTPUT"
 
   # ── 3. POST PR COMMENT ───────────────────────────────────────────────────
   pr-comment:
-    name: "💬 Post PR Comment"
+    name: "Post PR Comment"
     runs-on: ${{ inputs.runs_on }}
     needs: [resolve-version, release]
-    # FIXED: also runs when only the trigger PR number is available (pr_numbers is never empty now)
     if: needs.release.outputs.pr_numbers != '' || needs.resolve-version.outputs.pr_number != ''
     steps:
       - name: Post release comment on associated PRs
         env:
-          GH_TOKEN:        ${{ secrets.GH_TOKEN }}
-          PR_NUMBERS:      ${{ needs.release.outputs.pr_numbers }}
-          TRIGGER_PR:      ${{ needs.resolve-version.outputs.pr_number }}
-          VERSION:         ${{ needs.resolve-version.outputs.version }}
-          MODE:            ${{ needs.resolve-version.outputs.mode }}
-          RELEASE_URL:     ${{ needs.release.outputs.release_url }}
-          COMPARE_URL:     ${{ needs.release.outputs.compare_url }}
-          APP_NAME:        ${{ inputs.app_name }}
-          BASE:            ${{ inputs.base_branch }}
-          DEPLOYED_BY:     ${{ github.actor }}
+          GH_TOKEN:    ${{ secrets.GH_TOKEN }}
+          PR_NUMBERS:  ${{ needs.release.outputs.pr_numbers }}
+          TRIGGER_PR:  ${{ needs.resolve-version.outputs.pr_number }}
+          VERSION:     ${{ needs.resolve-version.outputs.version }}
+          MODE:        ${{ needs.resolve-version.outputs.mode }}
+          RELEASE_URL: ${{ needs.release.outputs.release_url }}
+          COMPARE_URL: ${{ needs.release.outputs.compare_url }}
+          APP_NAME:    ${{ inputs.app_name }}
+          BASE:        ${{ inputs.base_branch }}
+          DEPLOYED_BY: ${{ github.actor }}
         run: |
           export GH_REPO="${{ github.repository }}"
 
-          # ── Build display version string ──
           if [ "$MODE" = "major" ] || [ "$MODE" = "minor" ] || [ "$MODE" = "patch" ]; then
             MODE_LABEL="$(echo "$MODE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
             DISPLAY_VERSION="${VERSION} (${MODE_LABEL})"
@@ -367,25 +337,23 @@ ${AUTO_NOTES}"
             DISPLAY_VERSION="${DATE_PART}.v${COUNTER_PART}"
           fi
 
-          # ── Build the comment body ──
-          COMMENT="## 🚀 Released in ${DISPLAY_VERSION}
+          DEPLOYED_AT="$(date +'%Y-%m-%d %H:%M UTC')"
 
-**App:** \`${APP_NAME}\`
-**Branch:** \`${BASE}\`
-**Deployed:** $(date +'%Y-%m-%d %H:%M UTC')
-**Released by:** @${DEPLOYED_BY}
-"
+          # Write comment to a temp file — avoids all YAML/shell quoting issues
+          COMMENT_FILE=$(mktemp)
+          printf "## Released in %s\n\n" "$DISPLAY_VERSION"        >> "$COMMENT_FILE"
+          printf "App: %s\n"             "$APP_NAME"                >> "$COMMENT_FILE"
+          printf "Branch: %s\n"          "$BASE"                    >> "$COMMENT_FILE"
+          printf "Deployed: %s\n"        "$DEPLOYED_AT"             >> "$COMMENT_FILE"
+          printf "Released by: @%s\n"    "$DEPLOYED_BY"             >> "$COMMENT_FILE"
+
           if [ -n "$COMPARE_URL" ]; then
-            COMMENT="${COMMENT}
-**Full Changelog:** ${COMPARE_URL}
-"
+            printf "\nFull Changelog: %s\n" "$COMPARE_URL" >> "$COMMENT_FILE"
           fi
 
-          COMMENT="${COMMENT}
-See the full release notes: ${RELEASE_URL}"
+          printf "\nRelease notes: %s\n" "$RELEASE_URL" >> "$COMMENT_FILE"
 
-          # ── FIXED: fall back to trigger PR if git log found nothing ──
-          # Merge PR_NUMBERS with TRIGGER_PR so the comment is always posted
+          # Ensure trigger PR is always in the list
           FINAL_PR_LIST="$PR_NUMBERS"
           if [ -n "$TRIGGER_PR" ]; then
             if ! echo " $FINAL_PR_LIST " | grep -q " ${TRIGGER_PR} "; then
@@ -394,9 +362,11 @@ See the full release notes: ${RELEASE_URL}"
           fi
           FINAL_PR_LIST=$(echo "$FINAL_PR_LIST" | xargs)
 
-          echo "💬 Posting comment to PRs: $FINAL_PR_LIST"
+          echo "Posting to PRs: $FINAL_PR_LIST"
 
           for PR in $FINAL_PR_LIST; do
-            echo "   → PR #$PR"
-            gh pr comment "$PR" --body "$COMMENT" || echo "⚠️  Could not comment on PR #$PR"
+            echo "Commenting on PR #$PR"
+            gh pr comment "$PR" --body-file "$COMMENT_FILE" || echo "Could not comment on PR #$PR"
           done
+
+          rm -f "$COMMENT_FILE"
