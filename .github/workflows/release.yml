@@ -220,7 +220,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Explicitly set remote URL with PAT so push is authenticated
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ inputs.target_repo }}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ inputs.target_repo }}"
 
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
