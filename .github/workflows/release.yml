@@ -32,6 +32,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       last_tag: ${{ steps.version.outputs.last_tag }}
       mode: ${{ steps.version.outputs.mode }}
+      pr_body: ${{ steps.bump.outputs.pr_body }}
+      pr_number: ${{ steps.bump.outputs.pr_number }}
     steps:
       - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
@@ -49,13 +51,13 @@ jobs:
         run: |
           export GH_REPO="$REPO"
 
-          # Get the latest merged PR into base_branch
+          # Get latest merged PR sorted by mergedAt descending
           LATEST_PR=$(gh pr list \
             --state merged \
             --base "$BASE" \
             --limit 1 \
-            --json number,body \
-            --jq '.[0]')
+            --json number,body,mergedAt \
+            --jq 'sort_by(.mergedAt) | reverse | .[0]')
 
           PR_NUMBER=$(echo "$LATEST_PR" | jq -r '.number // empty')
           PR_BODY=$(echo "$LATEST_PR" | jq -r '.body // empty')
@@ -69,11 +71,11 @@ jobs:
           IS_MINOR=false
           IS_PATCH=false
 
-          if echo "$PR_BODY" | grep -iqE "major\s*=\s*true"; then
+          if echo "$PR_BODY" | grep -iE "major[[:space:]]*=[[:space:]]*true" > /dev/null 2>&1; then
             IS_MAJOR=true
-          elif echo "$PR_BODY" | grep -iqE "minor\s*=\s*true"; then
+          elif echo "$PR_BODY" | grep -iE "minor[[:space:]]*=[[:space:]]*true" > /dev/null 2>&1; then
             IS_MINOR=true
-          elif echo "$PR_BODY" | grep -iqE "patch\s*=\s*true"; then
+          elif echo "$PR_BODY" | grep -iE "patch[[:space:]]*=[[:space:]]*true" > /dev/null 2>&1; then
             IS_PATCH=true
           fi
 
@@ -81,6 +83,14 @@ jobs:
           echo "is_major=$IS_MAJOR" >> "$GITHUB_OUTPUT"
           echo "is_minor=$IS_MINOR" >> "$GITHUB_OUTPUT"
           echo "is_patch=$IS_PATCH" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Pass full PR body as output (used in release notes)
+          {
+            echo "pr_body<<PR_BODY_EOF"
+            echo "$PR_BODY"
+            echo "PR_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Resolve next version
         id: version
@@ -101,33 +111,33 @@ jobs:
               | head -n 1 || echo "")
 
             if [ -z "$LAST_TAG" ]; then
-              MAJOR=0; MINOR=0; PATCH=0
+              MAJOR=0; MINOR_V=0; PATCH_V=0
               LAST_TAG="none"
             else
               CLEAN="${LAST_TAG#v}"
               MAJOR=$(echo "$CLEAN" | cut -d. -f1)
-              MINOR=$(echo "$CLEAN" | cut -d. -f2)
-              PATCH=$(echo "$CLEAN" | cut -d. -f3)
+              MINOR_V=$(echo "$CLEAN" | cut -d. -f2)
+              PATCH_V=$(echo "$CLEAN" | cut -d. -f3)
             fi
 
             if [ "$IS_MAJOR" = "true" ]; then
-              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+              MAJOR=$((MAJOR + 1)); MINOR_V=0; PATCH_V=0
               MODE="major"
             elif [ "$IS_MINOR" = "true" ]; then
-              MINOR=$((MINOR + 1)); PATCH=0
+              MINOR_V=$((MINOR_V + 1)); PATCH_V=0
               MODE="minor"
             else
-              PATCH=$((PATCH + 1))
+              PATCH_V=$((PATCH_V + 1))
               MODE="patch"
             fi
 
-            NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+            NEW_VERSION="v${MAJOR}.${MINOR_V}.${PATCH_V}"
 
             # Safety: keep incrementing if tag already exists
             while git tag | grep -q "^${NEW_VERSION}$"; do
               echo "⚠️  Tag $NEW_VERSION already exists, incrementing patch..."
-              PATCH=$((PATCH + 1))
-              NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+              PATCH_V=$((PATCH_V + 1))
+              NEW_VERSION="v${MAJOR}.${MINOR_V}.${PATCH_V}"
             done
 
             echo "✅ Semver mode ($MODE): $NEW_VERSION"
@@ -176,7 +186,6 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     needs: resolve-version
     outputs:
-      release_notes: ${{ steps.create.outputs.release_notes }}
       release_url: ${{ steps.create.outputs.release_url }}
       compare_url: ${{ steps.create.outputs.compare_url }}
       pr_numbers: ${{ steps.create.outputs.pr_numbers }}
@@ -188,13 +197,15 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
 
-      - name: Create tag, release, and detect related PRs
+      - name: Create tag, release, and build notes
         id: create
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
           LAST_TAG: ${{ needs.resolve-version.outputs.last_tag }}
           MODE: ${{ needs.resolve-version.outputs.mode }}
+          LATEST_PR_BODY: ${{ needs.resolve-version.outputs.pr_body }}
+          LATEST_PR_NUMBER: ${{ needs.resolve-version.outputs.pr_number }}
           APP_NAME: ${{ inputs.app_name }}
           BASE: ${{ inputs.base_branch }}
           REPO: ${{ github.repository }}
@@ -220,15 +231,7 @@ jobs:
             TITLE="${APP_NAME} Release - ${DATE_PART}.v${COUNTER_PART}"
           fi
 
-          # Create release with auto-generated notes
-          gh release create "$VERSION" \
-            --title "$TITLE" \
-            --generate-notes \
-            --target "$BASE"
-
-          echo "✅ GitHub Release created: $VERSION"
-
-          # Detect related PR numbers from commit messages
+          # Detect all PR numbers in this release range
           if [ "$LAST_TAG" = "none" ]; then
             RANGE="origin/$BASE"
           else
@@ -236,15 +239,18 @@ jobs:
           fi
 
           PR_NUMBERS=$(git log "$RANGE" --pretty=format:'%s' 2>/dev/null \
-            | grep -oP '#\K[0-9]+' | sort -un | tr '\n' ' ' || echo "")
+            | grep -oE '#[0-9]+' | tr -d '#' | sort -un | tr '\n' ' ' || echo "")
 
-          # Collect PR descriptions and prepend to release notes
+          echo "🔍 PRs in this release: $PR_NUMBERS"
+
+          # ── Build PR Descriptions section ──
           PR_DESCRIPTIONS=""
           for PR in $PR_NUMBERS; do
             DESC=$(gh pr view "$PR" --json body --jq '.body' 2>/dev/null || echo "")
-            if [ -n "$DESC" ] && [ "$DESC" != "null" ]; then
+            if [ -n "$DESC" ] && [ "$DESC" != "null" ] && [ "$DESC" != "" ]; then
+              PR_TITLE=$(gh pr view "$PR" --json title --jq '.title' 2>/dev/null || echo "PR #$PR")
               PR_DESCRIPTIONS="${PR_DESCRIPTIONS}
-          ### PR #${PR} Description
+          ### PR #${PR} — ${PR_TITLE}
           ${DESC}
 
           ---
@@ -252,11 +258,18 @@ jobs:
             fi
           done
 
-          # Get auto-generated What's Changed notes
+          # ── Create release to get auto-generated What's Changed ──
+          gh release create "$VERSION" \
+            --title "$TITLE" \
+            --generate-notes \
+            --target "$BASE"
+
+          echo "✅ GitHub Release created: $VERSION"
+
           AUTO_NOTES=$(gh release view "$VERSION" --json body --jq '.body')
           URL=$(gh release view "$VERSION" --json url --jq '.url')
 
-          # Build final notes: PR descriptions first, then What's Changed
+          # ── Combine: PR descriptions first, then What's Changed ──
           if [ -n "$PR_DESCRIPTIONS" ]; then
             FINAL_NOTES="## 📋 PR Descriptions
           ${PR_DESCRIPTIONS}
@@ -266,7 +279,7 @@ jobs:
             FINAL_NOTES="${AUTO_NOTES}"
           fi
 
-          # Update release body with combined notes
+          # Update release with combined notes
           gh release edit "$VERSION" --notes "$FINAL_NOTES"
 
           if [ "$LAST_TAG" = "none" ]; then
@@ -275,11 +288,6 @@ jobs:
             COMPARE_URL="https://github.com/${REPO}/compare/${LAST_TAG}...${VERSION}"
           fi
 
-          {
-            echo "release_notes<<NOTES_EOF"
-            echo "$FINAL_NOTES"
-            echo "NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
           echo "release_url=$URL" >> "$GITHUB_OUTPUT"
           echo "compare_url=$COMPARE_URL" >> "$GITHUB_OUTPUT"
           echo "pr_numbers=${PR_NUMBERS}" >> "$GITHUB_OUTPUT"
@@ -306,7 +314,7 @@ jobs:
           export GH_REPO="${{ github.repository }}"
 
           if [ "$MODE" = "major" ] || [ "$MODE" = "minor" ] || [ "$MODE" = "patch" ]; then
-            MODE_LABEL="$(echo $MODE | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+            MODE_LABEL="$(echo "$MODE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
             DISPLAY_VERSION="${VERSION} (${MODE_LABEL})"
           else
             DATE_PART="${VERSION%.*}"
