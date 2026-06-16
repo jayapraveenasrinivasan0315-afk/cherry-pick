@@ -8,13 +8,14 @@ name: Reusable Release Workflow
 #   - Creates a Git tag and GitHub Release
 #   - Posts a release summary comment on the associated PR
 #
+# Operates on the calling repository (the repo that invokes this reusable workflow).
+#
 # Caller example (in the consuming repo):
 #   jobs:
 #     release:
 #       uses: your-org/infra/.github/workflows/release.yml@main
 #       with:
 #         app_name: time-guard
-#         target_repo: your-org/time-guard
 #         version_bump: minor        # optional — patch | minor | major (default: patch)
 #       secrets:
 #         GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -35,10 +36,6 @@ on:
         required: false
         type: string
         default: ''
-      target_repo:
-        description: 'owner/repo where the tag and release will be created (e.g. my-org/time-guard)'
-        required: true
-        type: string
       base_branch:
         description: 'Branch to tag and release from'
         required: false
@@ -68,10 +65,9 @@ jobs:
       version:  ${{ steps.version.outputs.version }}
       last_tag: ${{ steps.version.outputs.last_tag }}
     steps:
-      - name: Checkout ${{ inputs.target_repo }} — ${{ inputs.base_branch }}
+      - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
@@ -136,10 +132,9 @@ jobs:
       pr_comment:    ${{ steps.notes.outputs.pr_comment }}
       pr_numbers:    ${{ steps.notes.outputs.pr_numbers }}
     steps:
-      - name: Checkout ${{ inputs.target_repo }} — ${{ inputs.base_branch }}
+      - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
@@ -151,7 +146,6 @@ jobs:
           LAST_TAG:  ${{ needs.resolve-version.outputs.last_tag }}
           VERSION:   ${{ needs.resolve-version.outputs.version }}
           APP_NAME:  ${{ inputs.app_name }}
-          REPO:      ${{ inputs.target_repo }}
           BUMP:      ${{ inputs.version_bump }}
         run: |
           if [ "$LAST_TAG" = "none" ]; then
@@ -170,7 +164,7 @@ jobs:
           ALL_PR_NUMS=""
 
           for PR in $PR_NUMBERS; do
-            PR_DATA=$(gh pr view "$PR" --repo "$REPO" --json title,labels 2>/dev/null || echo "")
+            PR_DATA=$(gh pr view "$PR" --json title,labels 2>/dev/null || echo "")
             [ -z "$PR_DATA" ] && continue
 
             TITLE=$(echo  "$PR_DATA" | jq -r '.title')
@@ -243,10 +237,9 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     needs: [resolve-version, generate-notes]
     steps:
-      - name: Checkout ${{ inputs.target_repo }} — ${{ inputs.base_branch }}
+      - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
@@ -260,7 +253,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ inputs.target_repo }}"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}"
 
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
@@ -275,7 +268,6 @@ jobs:
           TITLE="${APP:+$APP }Release $VERSION"
 
           gh release create "$VERSION" \
-            --repo ${{ inputs.target_repo }} \
             --title "$TITLE" \
             --notes "${{ needs.generate-notes.outputs.release_notes }}" \
             --target ${{ inputs.base_branch }}
@@ -293,7 +285,6 @@ jobs:
           GH_TOKEN:   ${{ secrets.GH_TOKEN }}
           PR_NUMBERS: ${{ needs.generate-notes.outputs.pr_numbers }}
           COMMENT:    ${{ needs.generate-notes.outputs.pr_comment }}
-          REPO:       ${{ inputs.target_repo }}
         run: |
           if [ -z "$PR_NUMBERS" ]; then
             echo "ℹ️  No PRs found to comment on."
@@ -302,5 +293,5 @@ jobs:
 
           for PR in $PR_NUMBERS; do
             echo "💬 Posting comment on PR #$PR"
-            gh pr comment "$PR" --repo "$REPO" --body "$COMMENT" || echo "⚠️  Could not comment on PR #$PR"
+            gh pr comment "$PR" --body "$COMMENT" || echo "⚠️  Could not comment on PR #$PR"
           done
