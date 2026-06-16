@@ -1,12 +1,12 @@
 name: Reusable Release Workflow
 
 # Triggered after production deployment. Automatically:
-#   - Resolves the next semantic version from the latest release tag
-#   - Supports manual bump type: patch (default) | minor | major
-#   - Collects commits since the last release
-#   - Generates grouped release notes (features, fixes, improvements, breaking changes)
+#   - Resolves the next date-based version (tag: YYYYMMDD.N, title: YYYYMMDD.vN)
 #   - Creates a Git tag and GitHub Release
-#   - Posts a release summary comment on the associated PR
+#   - Uses GitHub's native --generate-notes to build the "What's Changed" notes
+#     (PR titles + contributor usernames + full changelog link)
+#   - Posts a release summary comment on each associated PR, including who
+#     triggered the release and a Full Changelog comparison link
 #
 # Operates on the calling repository (the repo that invokes this reusable workflow).
 #
@@ -15,15 +15,24 @@ name: Reusable Release Workflow
 #     release:
 #       uses: your-org/infra/.github/workflows/release.yml@main
 #       with:
-#         app_name: time-guard
-#         version_bump: minor        # optional — patch | minor | major (default: patch)
+#         app_name: Production        # optional — shown as "<app_name> Release - ..."
 #       secrets:
 #         GH_TOKEN: ${{ secrets.GH_PAT }}
 #
-# Version bump behaviour:
-#   patch  →  v1.0.3 → v1.0.4   (default, bug fixes / small changes)
-#   minor  →  v1.0.3 → v1.1.0   (new features, resets patch to 0)
-#   major  →  v1.0.3 → v2.0.0   (breaking changes, resets minor + patch to 0)
+# Versioning scheme:
+#   Tag:    YYYYMMDD.N   (e.g. 20260612.2)   — used for git tag + compare links
+#   Title:  YYYYMMDD.vN  (e.g. 20260612.v2)  — used for the release title only
+#
+#   1st release on a given day  → tag 20260612.1   title "...20260612.v1"
+#   2nd release same day        → tag 20260612.2   title "...20260612.v2"
+#   3rd release same day        → tag 20260612.3   title "...20260612.v3"
+#   Next day resets the counter → tag 20260613.1   title "...20260613.v1"
+#
+# Note on PR comments: PR numbers are detected by scanning commit messages for
+# a "(#123)" pattern, which GitHub appends to commit subjects regardless of
+# whether the repo uses squash, rebase, or merge-commit strategy. If no PRs
+# are found, the pr-comment job simply skips — this is expected on the very
+# first release, or for commits pushed directly without a PR.
 #
 # PAT required scopes:
 #   repo (full) — push tags, create releases, comment on PRs
@@ -32,37 +41,32 @@ on:
   workflow_call:
     inputs:
       app_name:
-        description: 'Application name shown in release title and PR comment'
+        description: 'Label shown in release title and PR comment (default: "Production")'
         required: false
         type: string
-        default: ''
+        default: "Production"
       base_branch:
-        description: 'Branch to tag and release from'
+        description: "Branch to tag and release from"
         required: false
         type: string
-        default: 'production'
-      version_bump:
-        description: 'Which part of the version to increment — patch | minor | major (default: patch)'
-        required: false
-        type: string
-        default: 'patch'
+        default: "production"
       runs_on:
-        description: 'GitHub Actions runner label'
+        description: "GitHub Actions runner label"
         required: false
         type: string
-        default: 'ubuntu-latest'
+        default: "ubuntu-latest"
     secrets:
       GH_TOKEN:
-        description: 'GitHub PAT with repo scope (contents:write + pull-requests:write)'
+        description: "GitHub PAT with repo scope (contents:write + pull-requests:write)"
         required: true
 
 jobs:
-  # ── 1. RESOLVE VERSION ───────────────────────────────────────────────────
+  # ── 1. RESOLVE VERSION (date-based: YYYYMMDD.N) ─────────────────────────
   resolve-version:
-    name: 🔢 Resolve Next Version
+    name: "🔢 Resolve Next Version"
     runs-on: ${{ inputs.runs_on }}
     outputs:
-      version:  ${{ steps.version.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
       last_tag: ${{ steps.version.outputs.last_tag }}
     steps:
       - name: Checkout ${{ inputs.base_branch }}
@@ -72,65 +76,56 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
 
-      - name: Resolve next version
+      - name: Resolve next date-based version
         id: version
         run: |
-          BUMP="${{ inputs.version_bump }}"
+          TODAY=$(date +'%Y%m%d')
 
-          # Validate bump type
-          if [[ "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
-            echo "❌ Invalid version_bump value: '$BUMP'. Must be patch | minor | major"
-            exit 1
-          fi
-
-          # Get the latest tag sorted by semver
-          LAST_TAG=$(git tag --sort=-version:refname | grep "^v" | head -n 1 || echo "")
-
+          # Most recent tag overall (any date) — used as the comparison
+          # point for the Full Changelog link.
+          LAST_TAG=$(git tag --sort=-creatordate | grep -E "^[0-9]{8}\.[0-9]+$" | head -n 1 || echo "")
           if [ -z "$LAST_TAG" ]; then
-            # No tags at all — start from v1.0.0 regardless of bump type
-            NEW_VERSION="v1.0.0"
             LAST_TAG="none"
-            echo "ℹ️  No previous tags found. Starting at $NEW_VERSION"
-          else
-            echo "ℹ️  Last release tag : $LAST_TAG"
-            echo "ℹ️  Bump type        : $BUMP"
-
-            MAJOR=$(echo "$LAST_TAG" | cut -d. -f1 | tr -d 'v')
-            MINOR=$(echo "$LAST_TAG" | cut -d. -f2)
-            PATCH=$(echo "$LAST_TAG" | cut -d. -f3)
-
-            if [ "$BUMP" = "major" ]; then
-              NEW_VERSION="v$((MAJOR + 1)).0.0"
-            elif [ "$BUMP" = "minor" ]; then
-              NEW_VERSION="v${MAJOR}.$((MINOR + 1)).0"
-            else
-              # patch (default)
-              NEW_VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
-            fi
           fi
 
-          # Safety: if this tag already exists keep incrementing patch
+          # Highest counter already used today, if any.
+          LAST_TODAY_COUNTER=$(git tag \
+            | grep -E "^${TODAY}\.[0-9]+$" \
+            | sed -E "s/^${TODAY}\.//" \
+            | sort -n \
+            | tail -n 1 || echo "")
+
+          if [ -z "$LAST_TODAY_COUNTER" ]; then
+            NEXT_COUNTER=1
+            echo "ℹ️  First release today. Starting at ${TODAY}.1"
+          else
+            NEXT_COUNTER=$((LAST_TODAY_COUNTER + 1))
+            echo "ℹ️  Last release today : ${TODAY}.${LAST_TODAY_COUNTER}"
+          fi
+
+          NEW_VERSION="${TODAY}.${NEXT_COUNTER}"
+
+          # Safety: if this tag already exists keep incrementing.
           while git tag | grep -q "^${NEW_VERSION}$"; do
-            echo "⚠️  Tag $NEW_VERSION already exists, incrementing patch..."
-            MAJOR=$(echo "$NEW_VERSION" | cut -d. -f1 | tr -d 'v')
-            MINOR=$(echo "$NEW_VERSION" | cut -d. -f2)
-            PATCH=$(echo "$NEW_VERSION" | cut -d. -f3)
-            NEW_VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "⚠️  Tag $NEW_VERSION already exists, incrementing..."
+            NEXT_COUNTER=$((NEXT_COUNTER + 1))
+            NEW_VERSION="${TODAY}.${NEXT_COUNTER}"
           done
 
-          echo "✅ Next version : $NEW_VERSION"
+          echo "✅ Next version : $NEW_VERSION  (3rd+ same-day release just keeps counting: .1 → .2 → .3 → ...)"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "last_tag=$LAST_TAG"   >> "$GITHUB_OUTPUT"
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
 
-  # ── 2. GENERATE RELEASE NOTES ────────────────────────────────────────────
-  generate-notes:
-    name: 📋 Generate Release Notes
+  # ── 2. CREATE TAG & GITHUB RELEASE (notes auto-generated by GitHub) ──────
+  release:
+    name: "🏷️ Create Tag & GitHub Release"
     runs-on: ${{ inputs.runs_on }}
     needs: resolve-version
     outputs:
-      release_notes: ${{ steps.notes.outputs.release_notes }}
-      pr_comment:    ${{ steps.notes.outputs.pr_comment }}
-      pr_numbers:    ${{ steps.notes.outputs.pr_numbers }}
+      release_notes: ${{ steps.create.outputs.release_notes }}
+      release_url: ${{ steps.create.outputs.release_url }}
+      compare_url: ${{ steps.create.outputs.compare_url }}
+      pr_numbers: ${{ steps.create.outputs.pr_numbers }}
     steps:
       - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
@@ -139,157 +134,113 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
 
-      - name: Collect commits and generate notes
-        id: notes
-        env:
-          GH_TOKEN:  ${{ secrets.GH_TOKEN }}
-          LAST_TAG:  ${{ needs.resolve-version.outputs.last_tag }}
-          VERSION:   ${{ needs.resolve-version.outputs.version }}
-          APP_NAME:  ${{ inputs.app_name }}
-          BUMP:      ${{ inputs.version_bump }}
-        run: |
-          if [ "$LAST_TAG" = "none" ]; then
-            MERGE_COMMITS=$(git log origin/${{ inputs.base_branch }} --oneline --merges 2>/dev/null || echo "")
-          else
-            MERGE_COMMITS=$(git log "$LAST_TAG"..origin/${{ inputs.base_branch }} --oneline --merges 2>/dev/null || echo "")
-          fi
-
-          PR_NUMBERS=$(echo "$MERGE_COMMITS" | grep -oP '#\K[0-9]+' | sort -u || echo "")
-
-          BREAKING=""
-          FEATURES=""
-          FIXES=""
-          IMPROVEMENTS=""
-          OTHERS=""
-          ALL_PR_NUMS=""
-
-          for PR in $PR_NUMBERS; do
-            PR_DATA=$(gh pr view "$PR" --json title,labels 2>/dev/null || echo "")
-            [ -z "$PR_DATA" ] && continue
-
-            TITLE=$(echo  "$PR_DATA" | jq -r '.title')
-            LABELS=$(echo "$PR_DATA" | jq -r '.labels[].name' | tr '\n' ',' || echo "")
-            ENTRY="- ${TITLE} (#${PR})"
-            ALL_PR_NUMS="${ALL_PR_NUMS} ${PR}"
-
-            if echo "$LABELS" | grep -qiE "breaking|breaking-change"; then
-              BREAKING="${BREAKING}\n${ENTRY}"
-            elif echo "$LABELS" | grep -qiE "feature|enhancement"; then
-              FEATURES="${FEATURES}\n${ENTRY}"
-            elif echo "$LABELS" | grep -qiE "bug|fix|hotfix"; then
-              FIXES="${FIXES}\n${ENTRY}"
-            elif echo "$LABELS" | grep -qiE "improvement|refactor|perf"; then
-              IMPROVEMENTS="${IMPROVEMENTS}\n${ENTRY}"
-            else
-              OTHERS="${OTHERS}\n${ENTRY}"
-            fi
-          done
-
-          # Bump label for release notes header
-          case "$BUMP" in
-            major) BUMP_LABEL="💥 Major Release" ;;
-            minor) BUMP_LABEL="✳️ Minor Release"  ;;
-            *)     BUMP_LABEL="🔩 Patch Release"  ;;
-          esac
-
-          {
-            echo "release_notes<<RELEASE_EOF"
-            echo "## ${APP_NAME:+$APP_NAME }${VERSION} — ${BUMP_LABEL}"
-            echo ""
-            echo "> 🚀 Deployed to production on $(date +'%Y-%m-%d %H:%M UTC')"
-            echo ""
-            [ -n "$BREAKING"     ] && echo "## 💥 Breaking Changes"  && printf "%b\n" "$BREAKING"     && echo ""
-            [ -n "$FEATURES"     ] && echo "## ✨ New Features"       && printf "%b\n" "$FEATURES"     && echo ""
-            [ -n "$FIXES"        ] && echo "## 🐛 Bug Fixes"          && printf "%b\n" "$FIXES"        && echo ""
-            [ -n "$IMPROVEMENTS" ] && echo "## 🔧 Improvements"       && printf "%b\n" "$IMPROVEMENTS" && echo ""
-            [ -n "$OTHERS"       ] && echo "## 📦 Others"             && printf "%b\n" "$OTHERS"       && echo ""
-            if [ -z "$BREAKING" ] && [ -z "$FEATURES" ] && [ -z "$FIXES" ] && [ -z "$IMPROVEMENTS" ] && [ -z "$OTHERS" ]; then
-              echo "No changes recorded since last release."
-            fi
-            echo "RELEASE_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "pr_comment<<PR_EOF"
-            echo "## 🚀 Released in ${VERSION} (${BUMP_LABEL})"
-            echo ""
-            echo "**App:** \`${APP_NAME:-this repo}\`"
-            echo "**Version bump:** \`${BUMP}\`"
-            echo "**Deployed:** $(date +'%Y-%m-%d %H:%M UTC')"
-            echo "**Branch:** \`${{ inputs.base_branch }}\`"
-            echo ""
-            echo "---"
-            [ -n "$BREAKING"     ] && echo "### 💥 Breaking Changes"  && printf "%b\n" "$BREAKING"     && echo ""
-            [ -n "$FEATURES"     ] && echo "### ✨ New Features"       && printf "%b\n" "$FEATURES"     && echo ""
-            [ -n "$FIXES"        ] && echo "### 🐛 Bug Fixes"          && printf "%b\n" "$FIXES"        && echo ""
-            [ -n "$IMPROVEMENTS" ] && echo "### 🔧 Improvements"       && printf "%b\n" "$IMPROVEMENTS" && echo ""
-            [ -n "$OTHERS"       ] && echo "### 📦 Others"             && printf "%b\n" "$OTHERS"       && echo ""
-            echo "---"
-            echo "_Automatically generated by the release workflow._"
-            echo "PR_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "pr_numbers=${ALL_PR_NUMS}" >> "$GITHUB_OUTPUT"
-
-  # ── 3. CREATE TAG & GITHUB RELEASE ───────────────────────────────────────
-  release:
-    name: 🏷️ Create Tag & GitHub Release
-    runs-on: ${{ inputs.runs_on }}
-    needs: [resolve-version, generate-notes]
-    steps:
-      - name: Checkout ${{ inputs.base_branch }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.base_branch }}
-          fetch-depth: 0
-          token: ${{ secrets.GH_TOKEN }}
-
-      - name: Create and push Git tag
+      - name: Create tag, release, and detect related PRs
+        id: create
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          LAST_TAG: ${{ needs.resolve-version.outputs.last_tag }}
+          APP_NAME: ${{ inputs.app_name }}
+          BASE: ${{ inputs.base_branch }}
+          REPO: ${{ github.repository }}
         run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
-
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}"
 
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
           echo "🏷️ Tag pushed: $VERSION"
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
-          APP="${{ inputs.app_name }}"
-          TITLE="${APP:+$APP }Release $VERSION"
+          # Tag stays plain (YYYYMMDD.N) for git/compare links; the title
+          # gets the "v" prefix on the counter — e.g. 20260612.v2.
+          DATE_PART="${VERSION%.*}"
+          COUNTER_PART="${VERSION##*.}"
+          TITLE="${APP_NAME} Release - ${DATE_PART}.v${COUNTER_PART}"
 
+          # GitHub builds the "What's Changed" notes itself — PR titles,
+          # contributor usernames, and the Full Changelog link, automatically.
           gh release create "$VERSION" \
             --title "$TITLE" \
-            --notes "${{ needs.generate-notes.outputs.release_notes }}" \
-            --target ${{ inputs.base_branch }}
+            --generate-notes \
+            --target "$BASE"
 
           echo "✅ GitHub Release created: $VERSION"
 
-  # ── 4. POST PR COMMENT ───────────────────────────────────────────────────
+          NOTES=$(gh release view "$VERSION" --json body --jq '.body')
+          URL=$(gh release view "$VERSION" --json url --jq '.url')
+
+          if [ "$LAST_TAG" = "none" ]; then
+            COMPARE_URL=""
+          else
+            COMPARE_URL="https://github.com/${REPO}/compare/${LAST_TAG}...${VERSION}"
+          fi
+
+          {
+            echo "release_notes<<NOTES_EOF"
+            echo "$NOTES"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "release_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "compare_url=$COMPARE_URL" >> "$GITHUB_OUTPUT"
+
+          # Detect related PR numbers from commit subjects — works for
+          # squash, rebase, and merge-commit strategies alike.
+          if [ "$LAST_TAG" = "none" ]; then
+            RANGE="origin/$BASE"
+          else
+            RANGE="$LAST_TAG..origin/$BASE"
+          fi
+
+          PR_NUMBERS=$(git log "$RANGE" --pretty=format:'%s' 2>/dev/null \
+            | grep -oP '#\K[0-9]+' | sort -un | tr '\n' ' ' || echo "")
+
+          echo "pr_numbers=${PR_NUMBERS}" >> "$GITHUB_OUTPUT"
+
+  # ── 3. POST PR COMMENT ──────────────────────────────────────────────────
+  # Only runs for PRs detected via the "(#123)" pattern in commit subjects.
+  # If commits were pushed directly without a PR, this step has nothing to
+  # comment on and skips cleanly.
   pr-comment:
-    name: 💬 Post PR Comment
+    name: "💬 Post PR Comment"
     runs-on: ${{ inputs.runs_on }}
-    needs: [generate-notes, release]
+    needs: [resolve-version, release]
+    if: needs.release.outputs.pr_numbers != ''
     steps:
       - name: Post release comment on associated PRs
         env:
-          GH_TOKEN:   ${{ secrets.GH_TOKEN }}
-          PR_NUMBERS: ${{ needs.generate-notes.outputs.pr_numbers }}
-          COMMENT:    ${{ needs.generate-notes.outputs.pr_comment }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          PR_NUMBERS: ${{ needs.release.outputs.pr_numbers }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          RELEASE_URL: ${{ needs.release.outputs.release_url }}
+          COMPARE_URL: ${{ needs.release.outputs.compare_url }}
+          APP_NAME: ${{ inputs.app_name }}
+          BASE: ${{ inputs.base_branch }}
+          DEPLOYED_BY: ${{ github.actor }}
         run: |
-          if [ -z "$PR_NUMBERS" ]; then
-            echo "ℹ️  No PRs found to comment on."
-            exit 0
+          export GH_REPO="${{ github.repository }}"
+
+          DATE_PART="${VERSION%.*}"
+          COUNTER_PART="${VERSION##*.}"
+          DISPLAY_VERSION="${DATE_PART}.v${COUNTER_PART}"
+
+          COMMENT="## 🚀 Released in ${DISPLAY_VERSION}
+          "
+          COMMENT="${COMMENT}
+          **App:** \`${APP_NAME}\`
+          **Branch:** \`${BASE}\`
+          **Deployed:** $(date +'%Y-%m-%d %H:%M UTC')
+          **Released by:** @${DEPLOYED_BY}
+          "
+
+          if [ -n "$COMPARE_URL" ]; then
+            COMMENT="${COMMENT}
+          **Full Changelog:** ${COMPARE_URL}
+          "
           fi
+
+          COMMENT="${COMMENT}
+          See the full release notes: ${RELEASE_URL}"
 
           for PR in $PR_NUMBERS; do
             echo "💬 Posting comment on PR #$PR"
