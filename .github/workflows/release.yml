@@ -13,13 +13,12 @@ name: Reusable Release Workflow
 #       uses: your-org/infra/.github/workflows/release.yml@main
 #       with:
 #         app_name: time-guard
-#         target_repo: your-org/time-guard        # <-- the repo to tag & release
+#         target_repo: your-org/time-guard
 #       secrets:
-#         GH_TOKEN: ${{ secrets.GH_PAT }}         # PAT must have access to target_repo
+#         GH_TOKEN: ${{ secrets.GH_PAT }}
 #
 # PAT required scopes:
-#   repo (full)  — to push tags and create releases on the target repo
-#   read:org     — if the target repo is in an org
+#   repo (full) — push tags, create releases, comment on PRs
 
 on:
   workflow_call:
@@ -45,7 +44,7 @@ on:
         default: 'ubuntu-latest'
     secrets:
       GH_TOKEN:
-        description: 'GitHub PAT with repo scope on target_repo (contents:write + pull-requests:write)'
+        description: 'GitHub PAT with repo scope (contents:write + pull-requests:write)'
         required: true
 
 jobs:
@@ -57,13 +56,13 @@ jobs:
       version:  ${{ steps.version.outputs.version }}
       last_tag: ${{ steps.version.outputs.last_tag }}
     steps:
-      - name: Checkout target repo — ${{ inputs.base_branch }}
+      - name: Checkout ${{ inputs.target_repo }} — ${{ inputs.base_branch }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
-          token: ${{ secrets.GH_TOKEN }}       # PAT — allows cross-repo checkout
+          token: ${{ secrets.GH_TOKEN }}
 
       - name: Resolve next version
         id: version
@@ -105,7 +104,7 @@ jobs:
       pr_comment:    ${{ steps.notes.outputs.pr_comment }}
       pr_numbers:    ${{ steps.notes.outputs.pr_numbers }}
     steps:
-      - name: Checkout target repo — ${{ inputs.base_branch }}
+      - name: Checkout ${{ inputs.target_repo }} — ${{ inputs.base_branch }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.target_repo }}
@@ -138,7 +137,6 @@ jobs:
           ALL_PR_NUMS=""
 
           for PR in $PR_NUMBERS; do
-            # Use --repo flag so gh targets the correct repo, not the runner repo
             PR_DATA=$(gh pr view "$PR" --repo "$REPO" --json title,labels 2>/dev/null || echo "")
             [ -z "$PR_DATA" ] && continue
 
@@ -160,7 +158,6 @@ jobs:
             fi
           done
 
-          # ── GitHub Release notes ─────────────────────────────────────────
           {
             echo "release_notes<<RELEASE_EOF"
             echo "## ${APP_NAME:+$APP_NAME }Release ${VERSION}"
@@ -178,7 +175,6 @@ jobs:
             echo "RELEASE_EOF"
           } >> "$GITHUB_OUTPUT"
 
-          # ── PR comment ───────────────────────────────────────────────────
           {
             echo "pr_comment<<PR_EOF"
             echo "## 🚀 Released in ${VERSION}"
@@ -206,18 +202,26 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     needs: [resolve-version, generate-notes]
     steps:
-      - name: Checkout target repo — ${{ inputs.base_branch }}
+      - name: Checkout ${{ inputs.target_repo }} — ${{ inputs.base_branch }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
 
       - name: Create and push Git tag
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           VERSION="${{ needs.resolve-version.outputs.version }}"
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Explicitly set remote URL with PAT so push is authenticated
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ inputs.target_repo }}.git"
+
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
           echo "🏷️ Tag pushed: $VERSION"
