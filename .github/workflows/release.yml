@@ -30,6 +30,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       last_tag: ${{ steps.version.outputs.last_tag }}
+      release_type: ${{ steps.version.outputs.release_type }}
+      latest_pr: ${{ steps.version.outputs.latest_pr }}
+      pr_body: ${{ steps.version.outputs.pr_body }}
     steps:
       - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
@@ -40,27 +43,66 @@ jobs:
 
       - name: Resolve next semantic version
         id: version
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          BASE: ${{ inputs.base_branch }}
+          REPO: ${{ github.repository }}
         run: |
           LAST_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || echo "")
-
           if [ -z "$LAST_TAG" ]; then
+            LAST_TAG="none"
+          fi
+
+          if [ "$LAST_TAG" = "none" ]; then
+            RANGE="origin/$BASE"
+          else
+            RANGE="$LAST_TAG..origin/$BASE"
+          fi
+
+          # The "latest" PR is the most recently merged one in this range —
+          # i.e. the first "(#123)" match in default (newest-first) `git
+          # log` order. Its description is checked for a major=true /
+          # minor=true / patch=true flag (case-insensitive, optional spaces
+          # and quotes around "=" / "true"). Major beats minor beats patch
+          # if more than one is set. No PR, or no flag found, → patch.
+          LATEST_PR=$(git log "$RANGE" --pretty=format:'%s' 2>/dev/null | grep -oP '#\K[0-9]+' | head -n 1 || echo "")
+
+          PR_BODY=""
+          RELEASE_TYPE="patch"
+
+          if [ -n "$LATEST_PR" ]; then
+            echo "🔎 Latest PR detected: #$LATEST_PR"
+            PR_BODY=$(gh pr view "$LATEST_PR" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
+
+            if echo "$PR_BODY" | grep -qiE 'major[[:space:]]*=[[:space:]]*"?true"?'; then
+              RELEASE_TYPE="major"
+            elif echo "$PR_BODY" | grep -qiE 'minor[[:space:]]*=[[:space:]]*"?true"?'; then
+              RELEASE_TYPE="minor"
+            elif echo "$PR_BODY" | grep -qiE 'patch[[:space:]]*=[[:space:]]*"?true"?'; then
+              RELEASE_TYPE="patch"
+            fi
+            echo "🏷️  Release type from PR #$LATEST_PR description: $RELEASE_TYPE"
+          else
+            echo "ℹ️  No PR detected in this range — defaulting to a patch bump"
+          fi
+
+          if [ "$LAST_TAG" = "none" ]; then
             echo "ℹ️ No previous version tag found. Starting at v1.0.0"
             NEW_VERSION="v1.0.0"
-            LAST_TAG="none"
+            MAJOR=1
+            MINOR=0
           else
             echo "📌 Latest tag: $LAST_TAG"
             MAJOR=$(echo "$LAST_TAG" | sed -E 's/^v([0-9]+)\..*/\1/')
             MINOR=$(echo "$LAST_TAG" | sed -E 's/^v[0-9]+\.([0-9]+)\..*/\1/')
             PATCH=$(echo "$LAST_TAG" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/')
 
-            RELEASE_TYPE="patch"
-
             case "${RELEASE_TYPE}" in
-              major|Major)
+              major)
                 NEW_MAJOR=$((MAJOR + 1))
                 NEW_VERSION="v${NEW_MAJOR}.0.0"
                 ;;
-              minor|Minor)
+              minor)
                 NEW_MINOR=$((MINOR + 1))
                 NEW_VERSION="v${MAJOR}.${NEW_MINOR}.0"
                 ;;
@@ -82,6 +124,13 @@ jobs:
           echo "✅ Next version: $NEW_VERSION"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_type=$RELEASE_TYPE" >> "$GITHUB_OUTPUT"
+          echo "latest_pr=$LATEST_PR" >> "$GITHUB_OUTPUT"
+          {
+            echo "pr_body<<PR_BODY_EOF"
+            echo "$PR_BODY"
+            echo "PR_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   release:
     name: "🏷️ Create Tag & GitHub Release"
@@ -91,7 +140,6 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
       compare_url: ${{ steps.create.outputs.compare_url }}
       pr_numbers: ${{ steps.create.outputs.pr_numbers }}
-      release_type: ${{ steps.create.outputs.release_type }}
     steps:
       - name: Checkout ${{ inputs.base_branch }}
         uses: actions/checkout@v4
@@ -106,6 +154,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
           LAST_TAG: ${{ needs.resolve-version.outputs.last_tag }}
+          RELEASE_TYPE: ${{ needs.resolve-version.outputs.release_type }}
+          LATEST_PR: ${{ needs.resolve-version.outputs.latest_pr }}
+          PR_BODY: ${{ needs.resolve-version.outputs.pr_body }}
           APP_NAME: ${{ inputs.app_name }}
           BASE: ${{ inputs.base_branch }}
           REPO: ${{ github.repository }}
@@ -135,44 +186,40 @@ jobs:
             RANGE="$LAST_TAG..origin/$BASE"
           fi
 
+          # Full list of PRs in this release — used by the pr-comment job
+          # below to know which PRs to comment on (separate from the single
+          # "latest" PR used for the version flag and release notes).
           PR_NUMBERS=$(git log "$RANGE" --pretty=format:'%s' 2>/dev/null | grep -oP '#\K[0-9]+' | sort -un | tr '\n' ' ' || echo "")
-          LATEST_PR=$(git log "$RANGE" --pretty=format:'%s' 2>/dev/null | grep -oP '#\K[0-9]+' | head -n 1 || echo "")
 
-          NOTES=$(gh release view "$VERSION" --json body --jq '.body')
-          RELEASE_TYPE="Patch"
+          # GitHub's auto-generated notes already contain "## What's Changed"
+          # (every PR merged in this release, by everyone) plus a
+          # "**Full Changelog**" link at the very end.
+          AUTO_NOTES=$(gh release view "$VERSION" --json body --jq '.body')
 
           if [ -n "$LATEST_PR" ]; then
-            echo "🔎 Latest PR detected: #$LATEST_PR"
-            PR_BODY=$(gh pr view "$LATEST_PR" --json body --jq '.body' 2>/dev/null || echo "")
-
-            if echo "$PR_BODY" | grep -qiE 'major[[:space:]]*=[[:space:]]*"?true"?'; then
-              RELEASE_TYPE="Major"
-            elif echo "$PR_BODY" | grep -qiE 'minor[[:space:]]*=[[:space:]]*"?true"?'; then
-              RELEASE_TYPE="Minor"
-            fi
+            DISPLAY_TYPE=$(echo "$RELEASE_TYPE" | sed -E 's/^(.)/\U\1/')
 
             {
-              echo "$NOTES"
+              echo "### 📝 PR #${LATEST_PR}"
+              echo ""
+              echo "**Release Type:** ${DISPLAY_TYPE}"
+              echo ""
+              echo "$PR_BODY"
               echo ""
               echo "---"
               echo ""
-              echo "### 📝 Latest PR (#${LATEST_PR})"
-              echo ""
-              echo "**Release Type:** ${RELEASE_TYPE}"
-              echo ""
-              echo "$PR_BODY"
+              echo "$AUTO_NOTES"
             } > /tmp/release_notes.md
 
             gh release edit "$VERSION" --notes-file /tmp/release_notes.md
-            echo "✅ Release notes updated with Latest PR details"
+            echo "✅ Release notes updated: PR #$LATEST_PR description placed above the auto-generated changelog"
           else
-            echo "ℹ️ No PRs detected — using GitHub auto-generated notes"
+            echo "ℹ️ No PR detected — using GitHub's auto-generated notes only"
           fi
 
           echo "release_url=$URL" >> "$GITHUB_OUTPUT"
           echo "compare_url=$COMPARE_URL" >> "$GITHUB_OUTPUT"
           echo "pr_numbers=${PR_NUMBERS}" >> "$GITHUB_OUTPUT"
-          echo "release_type=${RELEASE_TYPE}" >> "$GITHUB_OUTPUT"
 
   pr-comment:
     name: "💬 Post PR Comment"
