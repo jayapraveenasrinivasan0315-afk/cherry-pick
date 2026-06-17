@@ -24,7 +24,6 @@ on:
         required: true
 
 jobs:
-  # ── 1. RESOLVE NEXT SEMANTIC VERSION ───────────────────────────────
   resolve-version:
     name: "🔢 Resolve Next Version"
     runs-on: ${{ inputs.runs_on }}
@@ -84,7 +83,6 @@ jobs:
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
 
-  # ── 2. CREATE TAG & GITHUB RELEASE ─────────────────────────────────────
   release:
     name: "🏷️ Create Tag & GitHub Release"
     runs-on: ${{ inputs.runs_on }}
@@ -176,7 +174,6 @@ jobs:
           echo "pr_numbers=${PR_NUMBERS}" >> "$GITHUB_OUTPUT"
           echo "release_type=${RELEASE_TYPE}" >> "$GITHUB_OUTPUT"
 
-  # ── 3. POST PR COMMENT ──────────────────────────────────────────────────
   pr-comment:
     name: "💬 Post PR Comment"
     runs-on: ${{ inputs.runs_on }}
@@ -195,19 +192,22 @@ jobs:
           DEPLOYED_BY: ${{ github.actor }}
         run: |
           COMMENT="## 🚀 Released in ${VERSION}
+          "
+          COMMENT="${COMMENT}
+          **App:** \`${APP_NAME}\`
+          **Branch:** \`${BASE}\`
+          **Deployed:** $(date +'%Y-%m-%d %H:%M UTC')
+          **Released by:** @${DEPLOYED_BY}
+          "
 
-**App:** \`${APP_NAME}\`
-**Branch:** \`${BASE}\`
-**Deployed:** $(date +'%Y-%m-%d %H:%M UTC')
-**Released by:** @${DEPLOYED_BY}"
-
-          if [ -n "$COMPARE_URL" ]; then
+          if [ -n "${COMPARE_URL}" ]; then
             COMMENT="${COMMENT}
-**Full Changelog:** ${COMPARE_URL}"
+          **Full Changelog:** ${COMPARE_URL}
+          "
           fi
 
           COMMENT="${COMMENT}
-See the full release notes: ${RELEASE_URL}"
+          See the full release notes: ${RELEASE_URL}"
 
           for PR in $PR_NUMBERS; do
             echo "💬 Posting comment on PR #$PR"
